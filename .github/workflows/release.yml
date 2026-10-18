@@ -1,0 +1,104 @@
+name: Publish Android preview
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/release.json']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-preview-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read release metadata
+        id: meta
+        run: |
+          node <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const release = JSON.parse(fs.readFileSync('.github/release.json', 'utf8'));
+          if (!/^v\d+\.\d+\.\d+$/.test(release.tag) || !/^[a-f0-9]{40}$/.test(release.source) ||
+              !/^[a-zA-Z0-9._-]+\.apk$/.test(release.asset)) throw new Error('Invalid release metadata');
+          fs.copyFileSync('.github/release.json', path.join(process.env.RUNNER_TEMP, 'gemini-release.json'));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `source=${release.source}\n`);
+          JS
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.source }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-37.0 build-tools;37.0.0'
+
+      - name: Test webpage adapters
+        run: |
+          npm ci --ignore-scripts
+          npm test
+
+      - name: Build and check Android app
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --no-build-cache -Pksp.incremental=false clean testDebugUnitTest lintDebug assembleDebug
+
+      - name: Publish release and APK
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+            const config = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'gemini-release.json'), 'utf8'));
+            const directory = 'app/build/outputs/apk/debug';
+            const metadata = JSON.parse(fs.readFileSync(path.join(directory, 'output-metadata.json'), 'utf8'));
+            if (metadata.applicationId !== 'com.rx.geminipro.debug' || metadata.elements.length !== 1 ||
+                `v${metadata.elements[0].versionName}` !== config.tag) throw new Error('APK version does not match release');
+            const apk = fs.readFileSync(path.join(directory, metadata.elements[0].outputFile));
+            const sha256 = crypto.createHash('sha256').update(apk).digest('hex');
+            const {owner, repo} = context.repo;
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({owner, repo, tag: config.tag})).data;
+              if (release.target_commitish !== config.source) throw new Error('Existing release points to a different commit');
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release = (await github.rest.repos.createRelease({owner, repo, tag_name: config.tag,
+                target_commitish: config.source, name: config.name, body: config.notes,
+                draft: false, prerelease: true})).data;
+            }
+            const assets = (await github.rest.repos.listReleaseAssets({owner, repo, release_id: release.id})).data;
+            const existing = assets.find(asset => asset.name === config.asset);
+            if (!existing) {
+              await github.rest.repos.uploadReleaseAsset({owner, repo, release_id: release.id,
+                name: config.asset, data: apk,
+                headers: {'content-type': 'application/vnd.android.package-archive', 'content-length': apk.length}});
+              const checksum = Buffer.from(`${sha256}  ${config.asset}\n`, 'utf8');
+              await github.rest.repos.uploadReleaseAsset({owner, repo, release_id: release.id,
+                name: `${config.asset}.sha256`, data: checksum,
+                headers: {'content-type': 'text/plain', 'content-length': checksum.length}});
+            } else if (existing.digest !== `sha256:${sha256}`) {
+              throw new Error('An APK already exists; refusing to overwrite a published binary');
+            }
+            core.info(`Published ${release.html_url}`);
