@@ -1,6 +1,7 @@
 package com.rx.geminipro.components
 
 fun generateHtmlWithMermaid(mermaidCode: String): String {
+    val escaped = mermaidCode.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return """
 <!doctype html>
 <html lang="en">
@@ -19,10 +20,10 @@ fun generateHtmlWithMermaid(mermaidCode: String): String {
     </style>
   </head>
   <body>
-    <pre class="mermaid">$mermaidCode</pre>
+    <pre class="mermaid">$escaped</pre>
     <script type="module">
       import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-      mermaid.initialize({ startOnLoad: true });
+      mermaid.initialize({ startOnLoad: true, securityLevel: "strict" });
     </script>
   </body>
 </html>

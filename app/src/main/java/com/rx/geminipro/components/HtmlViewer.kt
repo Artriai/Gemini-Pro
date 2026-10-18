@@ -33,9 +33,8 @@ fun HtmlViewer(htmlContent: String) {
             settings.loadWithOverviewMode = true
             settings.allowFileAccess = false
             settings.allowContentAccess = false
-            loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
         }
     }, update = { webView ->
         webView.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
-    })
+    }, onRelease = { it.stopLoading(); it.destroy() })
 }

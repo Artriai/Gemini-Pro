@@ -24,9 +24,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val splashDeadline = android.os.SystemClock.elapsedRealtime() + 4000
         installSplashScreen().apply {
             setKeepOnScreenCondition {
-                !geminiViewModel.uiState.value.isApplicationReady
+                !geminiViewModel.uiState.value.isApplicationReady && android.os.SystemClock.elapsedRealtime() < splashDeadline
             }
             setOnExitAnimationListener { screen ->
                 screen.remove()

@@ -13,6 +13,9 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
+import com.rx.geminipro.utils.system.extractPreviewContent
+import com.rx.geminipro.utils.system.PreviewKind
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -105,16 +108,19 @@ class GeminiViewModel @Inject constructor(
         }
     }
 
+    private var clipboardHintJob: Job? = null
+
     fun onClipboardTextChanged(text: String) {
-        val type = when {
-            getMermaidDiagramPrefixes().any { text.startsWith(it) } -> ClipboardContentType.DIAGRAM
-            text.lowercase().startsWith("<!doctype html") -> ClipboardContentType.HTML
-            else -> ClipboardContentType.NONE
+        clipboardHintJob?.cancel()
+        val type = when (extractPreviewContent(text).kind) {
+            PreviewKind.DIAGRAM -> ClipboardContentType.DIAGRAM
+            PreviewKind.HTML -> ClipboardContentType.HTML
+            PreviewKind.NONE -> ClipboardContentType.NONE
         }
         _uiState.update { it.copy(clipboardContentType = type) }
 
         if (type != ClipboardContentType.NONE) {
-            viewModelScope.launch {
+            clipboardHintJob = viewModelScope.launch {
                 delay(6500)
                 if (_uiState.value.clipboardContentType == type) {
                     _uiState.update { it.copy(clipboardContentType = ClipboardContentType.NONE) }
@@ -187,9 +193,9 @@ class GeminiViewModel @Inject constructor(
 
         viewModelScope.launch {
             if(uiState.value.isKeepScreenOn)
-                _sideEffectChannel.send(GeminiSideEffect.ShowToast("Caffeine mode was turned on"))
+                _sideEffectChannel.send(GeminiSideEffect.ShowToast(getApplication<Application>().getString(R.string.caffeine_on)))
             else
-                _sideEffectChannel.send(GeminiSideEffect.ShowToast("Caffeine mode was turned off"))
+                _sideEffectChannel.send(GeminiSideEffect.ShowToast(getApplication<Application>().getString(R.string.caffeine_off)))
         }
     }
 

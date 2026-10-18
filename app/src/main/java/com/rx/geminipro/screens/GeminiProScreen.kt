@@ -30,9 +30,15 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import com.rx.geminipro.R
 import com.rx.geminipro.components.*
-import com.rx.geminipro.utils.permissions.GetPermissions
+import com.rx.geminipro.utils.system.extractPreviewContent
+import androidx.compose.ui.res.painterResource
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.rx.geminipro.viewmodels.*
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 
 @Composable
@@ -40,16 +46,19 @@ fun GeminiProScreen(
     modifier: Modifier = Modifier,
     viewModel: GeminiViewModel = hiltViewModel(),
 ) {
-    val uiState by viewModel.uiState.collectAsState()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val clipboardManager = LocalContext.current.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
     var webView by remember { mutableStateOf<WebView?>(null) }
+    var reloadPage by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val ioScope = rememberCoroutineScope()
 
     var showAdditionalMenu by remember { mutableStateOf(value = false) }
     var showDiagram by remember { mutableStateOf(value = false) }
     var showHtmlPreview by remember { mutableStateOf(value = false) }
     var clipboardText by remember { mutableStateOf(value = "") }
+    var pendingSaveText by remember { mutableStateOf("") }
     var isHighlightingMenu by remember { mutableStateOf(value = false) }
 
     var tempCameraUri by remember { mutableStateOf<Uri?>(null) }
@@ -67,7 +76,7 @@ fun GeminiProScreen(
     ) { result ->
         if (filePathCallbackState.value == null) return@rememberLauncherForActivityResult
 
-        val uris: Array<Uri> = if (result.resultCode == Activity.RESULT_OK) {
+        val uris: Array<Uri>? = if (result.resultCode == Activity.RESULT_OK) {
             val data = result.data
 
             if (data?.data != null) {
@@ -77,15 +86,13 @@ fun GeminiProScreen(
                 val clip = data.clipData!!
                 List(clip.itemCount) { clip.getItemAt(it).uri }.toTypedArray()
             }
-            else if (tempCameraUri != null) {
+            else if (tempCameraUri != null && runCatching {
+                    context.contentResolver.openAssetFileDescriptor(tempCameraUri!!, "r")?.use { it.length > 0 } == true
+                }.getOrDefault(false)) {
                 arrayOf(tempCameraUri!!)
             }
-            else {
-                emptyArray()
-            }
-        } else {
-            emptyArray()
-        }
+            else null
+        } else null
 
         filePathCallbackState.value?.onReceiveValue(uris)
         filePathCallbackState.value = null
@@ -96,9 +103,18 @@ fun GeminiProScreen(
     val documentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("text/plain"),
     ) { uri ->
-        uri?.let {
-            context.contentResolver.openOutputStream(it)?.use { stream ->
-                stream.write(clipboardText.toByteArray())
+        val textToSave = pendingSaveText
+        pendingSaveText = ""
+        uri?.let { target ->
+            ioScope.launch {
+                val saved = withContext(Dispatchers.IO) {
+                    runCatching {
+                        checkNotNull(context.contentResolver.openOutputStream(target)).use {
+                            it.write(textToSave.toByteArray(Charsets.UTF_8))
+                        }
+                    }.isSuccess
+                }
+                Toast.makeText(context, if (saved) R.string.file_saved else R.string.save_failed, Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -106,7 +122,6 @@ fun GeminiProScreen(
     // --- Side Effect Handler ---
     LaunchedEffect(Unit) {
         viewModel.sideEffectFlow.collect { effect ->
-            val currentWebView = webView ?: return@collect
             when (effect) {
                 is GeminiSideEffect.LaunchIntent -> context.startActivity(effect.intent)
                 is GeminiSideEffect.ShowToast -> Toast.makeText(
@@ -115,26 +130,30 @@ fun GeminiProScreen(
                     Toast.LENGTH_SHORT,
                 ).show()
 
-                is GeminiSideEffect.LaunchSaveToFile -> documentLauncher.launch("gemini-note.txt")
-                is GeminiSideEffect.WebViewGoBack -> currentWebView.goBack()
-                is GeminiSideEffect.WebViewReload -> currentWebView.reload()
-                is GeminiSideEffect.WebViewGoForward -> currentWebView.goForward()
-                is GeminiSideEffect.LoadUrl -> currentWebView.loadUrl(effect.url)
+                is GeminiSideEffect.LaunchSaveToFile -> {
+                    pendingSaveText = clipboardText
+                    documentLauncher.launch("gemini-note.txt")
+                }
+                is GeminiSideEffect.WebViewGoBack -> webView?.goBack()
+                is GeminiSideEffect.WebViewReload -> reloadPage?.invoke()
+                is GeminiSideEffect.WebViewGoForward -> webView?.goForward()
+                is GeminiSideEffect.LoadUrl -> webView?.loadUrl(effect.url)
             }
         }
     }
 
-    // --- Clipboard Monitor ---
-    LaunchedEffect(clipboardManager) {
-        clipboardManager.addPrimaryClipChangedListener {
-            val clipData = clipboardManager.primaryClip
-            if ((clipData != null) && (clipData.itemCount > 0)) {
-                val text = clipData.getItemAt(0).text.toString()
-                clipboardText = text
-                viewModel.onClipboardTextChanged(text)
-            }
+    // Register once per screen and always remove the listener when leaving it.
+    DisposableEffect(clipboardManager) {
+        val listener = ClipboardManager.OnPrimaryClipChangedListener {
+            val text = clipboardManager.primaryClip?.takeIf { it.itemCount > 0 }
+                ?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+            clipboardText = text
+            viewModel.onClipboardTextChanged(text)
         }
+        clipboardManager.addPrimaryClipChangedListener(listener)
+        onDispose { clipboardManager.removePrimaryClipChangedListener(listener) }
     }
+    val previewCode = remember(clipboardText) { extractPreviewContent(clipboardText).code }
 
     // --- Back Handler Logic ---
     BackHandler(enabled = uiState.canWebViewGoBack) {
@@ -150,7 +169,6 @@ fun GeminiProScreen(
     }
 
     // --- UI Layer ---
-    GetPermissions(context)
 
     Box(
         modifier = modifier
@@ -168,18 +186,17 @@ fun GeminiProScreen(
             onProgressChanged = { progress ->
                 viewModel.onEvent(GeminiUiEvent.LoadingProgressChanged(progress))
             },
-            onPageFinished = { webView, _ ->
+            onPageFinished = { webView, url ->
                 viewModel.onEvent(
                     GeminiUiEvent.WebViewNavigated(
                         canGoBack = webView.canGoBack(),
-                        url = webView.url,
+                        url = url,
                     )
                 )
                 viewModel.onEvent(GeminiUiEvent.ApplicationReady)
             },
-            onCameraTmpFileCreated = { 
-                tempCameraUri = it 
-            }
+            onCameraTmpFileCreated = { tempCameraUri = it },
+            onReloadActionCreated = { reloadPage = it },
         )
 
         BrowserProgressBar(progress = uiState.loadingProgress)
@@ -212,14 +229,14 @@ fun GeminiProScreen(
 
         DiagramScreen(
             isDiagramVisible = showDiagram,
-            clipboardText = clipboardText,
+            clipboardText = previewCode,
             onBack = { showDiagram = false },
             onClose = { showDiagram = false }
         )
 
         HtmlPreviewScreen(
             isHtmlPreviewVisible = showHtmlPreview,
-            clipboardText = clipboardText,
+            clipboardText = previewCode,
             onBack = { showHtmlPreview = false },
             onClose = { showHtmlPreview = false }
         )
@@ -310,7 +327,7 @@ private fun BoxScope.PreviewButtons(
         visible = isVisible,
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it }),
-        modifier = Modifier.align(Alignment.BottomEnd)
+        modifier = Modifier.align(Alignment.BottomEnd).padding(bottom = 72.dp)
     ) {
         DialogButton(text = buttonText, onClick = onClick)
     }
@@ -330,10 +347,12 @@ private fun BoxScope.MenuHandles(
             .width(80.dp)
             .height(60.dp)
             .pointerInput(Unit) {
-                detectVerticalDragGestures { change, _ ->
-                    onReload()
-                    change.consume()
-                }
+                var distance = 0f
+                detectVerticalDragGestures(
+                    onDragStart = { distance = 0f },
+                    onDragEnd = { if (distance > 64.dp.toPx()) onReload() },
+                    onVerticalDrag = { change, amount -> distance += amount; change.consume() },
+                )
             }
     )
 
@@ -350,34 +369,41 @@ private fun BoxScope.MenuHandles(
             .width(30.dp)
             .fillMaxHeight(0.4f)
             .background(animatedColor)
-            .pointerInput(Unit) {
-                detectVerticalDragGestures { change, _ ->
-                    onOpenMenu()
-                    change.consume()
-                }
+            .pointerInput(isMenuLeft) {
+                var distance = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { distance = 0f },
+                    onDragEnd = { if (kotlin.math.abs(distance) > 32.dp.toPx()) onOpenMenu() },
+                    onHorizontalDrag = { change, amount -> distance += amount; change.consume() },
+                )
             }
     )
+    FilledTonalIconButton(
+        onClick = onOpenMenu,
+        modifier = Modifier.align(if (isMenuLeft) Alignment.BottomStart else Alignment.BottomEnd)
+            .navigationBarsPadding().padding(12.dp),
+    ) {
+        Icon(painterResource(R.drawable.outline_arrow_menu_open_24),
+            contentDescription = stringResource(R.string.open_menu))
+    }
 }
 
 @Composable
 private fun rememberMenuItems(onEvent: (GeminiUiEvent) -> Unit, isMenuLeft: Boolean): List<MenuItemData> {
-    return remember(isMenuLeft) {
-        listOf(
-            MenuItemData(R.drawable.google_docs, "Open Docs") { onEvent(GeminiUiEvent.OpenDocsClicked) },
-            MenuItemData(R.drawable.coffee_cup, "Caffeine") { onEvent(GeminiUiEvent.KeepScreenOnToggled) },
-            MenuItemData(R.drawable.google_flow_icon, "Google Flow") { onEvent(GeminiUiEvent.OpenFlowClicked) },
-            MenuItemData(R.drawable.note_text, "Save To File") { onEvent(GeminiUiEvent.SaveToFileClicked) },
-            MenuItemData(R.drawable.baseline_save_alt_24, "Download Video") { onEvent(GeminiUiEvent.ToggleVideoSelectionMode) },
-            MenuItemData(R.drawable.baseline_share_24, "Share Page") { onEvent(GeminiUiEvent.SharePageClicked) },
-            MenuItemData(R.drawable.baseline_link_24, "Copy Link") { onEvent(GeminiUiEvent.CopyLinkClicked) },
-            MenuItemData(R.drawable.baseline_replay_circle_filled_24, "Reload Page") { onEvent(GeminiUiEvent.ReloadPageClicked) },
-            MenuItemData(R.drawable.baseline_arrow_circle_right_24, "Go Forward") { onEvent(GeminiUiEvent.GoForwardClicked) },
-            MenuItemData(
-                painterResId = if (isMenuLeft) R.drawable.outline_arrow_menu_close_24 else R.drawable.outline_arrow_menu_open_24,
-                name = "Menu Side"
-            ) { onEvent(GeminiUiEvent.MenuPositionChanged(!isMenuLeft)) }
-        )
-    }
+    return listOf(
+        MenuItemData(R.drawable.google_docs, stringResource(R.string.open_docs)) { onEvent(GeminiUiEvent.OpenDocsClicked) },
+        MenuItemData(R.drawable.coffee_cup, stringResource(R.string.caffeine)) { onEvent(GeminiUiEvent.KeepScreenOnToggled) },
+        MenuItemData(R.drawable.google_flow_icon, "Google Flow") { onEvent(GeminiUiEvent.OpenFlowClicked) },
+        MenuItemData(R.drawable.note_text, stringResource(R.string.save_to_file)) { onEvent(GeminiUiEvent.SaveToFileClicked) },
+        MenuItemData(R.drawable.baseline_save_alt_24, stringResource(R.string.download_video)) { onEvent(GeminiUiEvent.ToggleVideoSelectionMode) },
+        MenuItemData(R.drawable.baseline_share_24, stringResource(R.string.share_page)) { onEvent(GeminiUiEvent.SharePageClicked) },
+        MenuItemData(R.drawable.baseline_link_24, stringResource(R.string.copy_link)) { onEvent(GeminiUiEvent.CopyLinkClicked) },
+        MenuItemData(R.drawable.baseline_replay_circle_filled_24, stringResource(R.string.reload_page)) { onEvent(GeminiUiEvent.ReloadPageClicked) },
+        MenuItemData(R.drawable.baseline_arrow_circle_right_24, stringResource(R.string.go_forward)) { onEvent(GeminiUiEvent.GoForwardClicked) },
+        MenuItemData(R.drawable.baseline_open_in_browser_24, stringResource(R.string.open_in_browser)) { onEvent(GeminiUiEvent.OpenInBrowserClicked) },
+        MenuItemData(if (isMenuLeft) R.drawable.outline_arrow_menu_close_24 else R.drawable.outline_arrow_menu_open_24,
+            stringResource(R.string.menu_side)) { onEvent(GeminiUiEvent.MenuPositionChanged(!isMenuLeft)) },
+    )
 }
 
 @Composable

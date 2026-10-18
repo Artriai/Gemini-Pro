@@ -1,6 +1,8 @@
 package com.rx.geminipro.screens
 
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.res.stringResource
+import com.rx.geminipro.R
 import androidx.compose.runtime.remember
 import com.rx.geminipro.components.HtmlViewer
 
@@ -10,7 +12,7 @@ fun HtmlPreviewScreen(isHtmlPreviewVisible: Boolean, clipboardText: String, onBa
 
     GenericPreviewScreen(
         isVisible = isHtmlPreviewVisible,
-        title = "Close Preview",
+        title = stringResource(R.string.close_preview),
         onBack = onBack,
         onClose = onClose
     ) {

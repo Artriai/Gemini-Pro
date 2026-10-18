@@ -15,13 +15,14 @@ data class UpdateInfo(
 )
 
 object UpdateChecker {
-    private const val GITHUB_API_URL = "https://api.github.com/repos/RxNaison/Gemini-Pro/releases/latest"
+    private const val GITHUB_API_URL = "https://api.github.com/repos/Artriai/Gemini-Pro/releases/latest"
 
 
     suspend fun checkForNewVersion(): UpdateInfo? = withContext(Dispatchers.IO) {
+        var connection: HttpURLConnection? = null
         try {
             val url = URL(GITHUB_API_URL)
-            val connection = url.openConnection() as HttpURLConnection
+            connection = url.openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
             connection.connectTimeout = 5000
             connection.readTimeout = 5000
@@ -44,6 +45,8 @@ object UpdateChecker {
             }
         } catch (e: Exception) {
             Log.e("UpdateChecker", "Check failed", e)
+        } finally {
+            connection?.disconnect()
         }
         return@withContext null
     }
@@ -63,6 +66,6 @@ object UpdateChecker {
     }
 
     fun getReleaseUrl(): String {
-        return "https://github.com/RxNaison/Gemini-Pro/releases/latest"
+        return "https://github.com/Artriai/Gemini-Pro/releases/latest"
     }
 }

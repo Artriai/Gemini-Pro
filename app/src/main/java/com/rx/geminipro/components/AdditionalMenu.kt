@@ -48,7 +48,7 @@ fun AdditionalMenuItem(painter: Painter, name: String, onClick: () -> Unit)
             content = {
                 Image(
                     painter = painter,
-                    contentDescription = null
+                    contentDescription = name
                 )
             }
         )

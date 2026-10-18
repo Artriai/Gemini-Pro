@@ -6,6 +6,15 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Bitmap
+import android.webkit.WebResourceResponse
+import androidx.webkit.WebViewAssetLoader
+import androidx.webkit.WebMessageCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import com.rx.geminipro.R
+import com.rx.geminipro.utils.network.WebOriginPolicy
+import com.rx.geminipro.utils.network.blobDownloadScript
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
@@ -41,7 +50,7 @@ class WebViewManager(
     private val context: Context,
     private val activity: WeakReference<ComponentActivity>,
 ) {
-    var onShowFileChooser: (ValueCallback<Array<Uri>>, Intent) -> Unit = { _, _ -> }
+    var onShowFileChooser: (ValueCallback<Array<Uri>>, Intent, Intent?) -> Unit = { callback, _, _ -> callback.onReceiveValue(null) }
 
     var onShowToast: (message: String) -> Unit = {}
 
@@ -50,6 +59,14 @@ class WebViewManager(
     var onPageFinished: (view: WebView, url: String) -> Unit = { _, _ -> }
 
     var onPermissionRequest: (request: PermissionRequest) -> Unit = { it.deny() }
+    var onPermissionCanceled: (PermissionRequest) -> Unit = {}
+    var onNavigationStarted: () -> Unit = {}
+    var withDownloadPermission: ((() -> Unit) -> Unit) = { it() }
+    private val blobDownloader = BlobDownloaderInterface(context)
+    private val downloadScript = context.assets.open("blob_download.js").bufferedReader().use { it.readText() }
+    private val assetLoader = WebViewAssetLoader.Builder()
+        .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context)).build()
+
     var onCameraTmpFileCreated: (Uri) -> Unit = {}
     var onProgressChanged: (Int) -> Unit = {}
 
@@ -57,7 +74,7 @@ class WebViewManager(
 
     private var lastUrl: String? = null
     private var lastFailedUrl: String? = null
-    private val errorUrl = "file:///android_asset/webview_error.html"
+    private val errorUrl = "https://appassets.androidplatform.net/assets/webview_error.html"
     private val spoofHeaders = mapOf("X-Requested-With" to "")
 
     // --- Core WebView Clients and Listeners ---
@@ -66,35 +83,49 @@ class WebViewManager(
         @SuppressLint("QueryPermissionsNeeded")
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val url = request.url.toString()
+            if (!request.isForMainFrame) return false
             return when {
-                url.startsWith("http://") || url.startsWith("https://") -> {
-                    view.loadUrl(url, spoofHeaders)
+                url == "geminipro://retry" -> {
+                    if (view.url == errorUrl) view.loadUrl(retryUrl(), spoofHeaders)
                     true
                 }
+                url.startsWith("https://") -> {
+                    if (WebOriginPolicy.isInternalNavigation(url)) false
+                    else handleExternalAppUrl(url)
+                }
+                url.startsWith("http://") -> handleExternalAppUrl(url)
                 url.startsWith("intent://") -> handleIntentUrl(url, view)
                 url.startsWith("tel:") || url.startsWith("mailto:") || url.startsWith("sms:") || url.startsWith("market:") -> handleExternalAppUrl(url)
-                else -> false
+                else -> true
             }
+        }
+
+        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+            assetLoader.shouldInterceptRequest(request.url)
+
+        override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+            blobDownloader.cancel()
+            onNavigationStarted()
+            super.onPageStarted(view, url, favicon)
         }
 
         override fun onPageFinished(view: WebView, url: String) {
             super.onPageFinished(view, url)
+            if (url != errorUrl) lastUrl = url
+            onPageFinished.invoke(view, if (url == errorUrl) retryUrl() else url)
+        }
 
-            val preventRevokeScript = """
-            window.URL.revokeObjectURL = function(url) {
-                console.log("GeminiPro: Blocked revocation of " + url);
-                // Do nothing! Keep the blob alive.
-            };
-        """.trimIndent()
-
-            view.evaluateJavascript(preventRevokeScript, null)
-
-            onPageFinished.invoke(view, url)
+        override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+            super.doUpdateVisitedHistory(view, url, isReload)
+            if (WebOriginPolicy.isInternalNavigation(url)) {
+                lastUrl = url
+                onPageFinished.invoke(view, url)
+            }
         }
 
         override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
             super.onReceivedError(view, request, error)
-            if (request?.isForMainFrame == true) {
+            if (request?.isForMainFrame == true && request.url.toString() != errorUrl) {
                 val failingUrl = request.url.toString()
                 Log.e(TAG, "WebView Error: ${error?.errorCode} - ${error?.description} for $failingUrl")
                 lastFailedUrl = failingUrl
@@ -119,7 +150,9 @@ class WebViewManager(
             var captureIntent: Intent? = null
 
             try {
-                val photoFile = File.createTempFile("gemini_cam_", ".jpg", context.cacheDir)
+                val cameraDir = File(context.cacheDir, "camera").apply { mkdirs() }
+                cameraDir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 86_400_000 }?.forEach { it.delete() }
+                val photoFile = File.createTempFile("gemini_cam_", ".jpg", cameraDir)
 
                 photoUri = FileProvider.getUriForFile(
                     context,
@@ -140,18 +173,24 @@ class WebViewManager(
 
             val chooserIntent = Intent(Intent.ACTION_CHOOSER)
             chooserIntent.putExtra(Intent.EXTRA_INTENT, galleryIntent)
-            chooserIntent.putExtra(Intent.EXTRA_TITLE, "Upload Image")
+            chooserIntent.putExtra(Intent.EXTRA_TITLE, context.getString(R.string.choose_file))
 
-            captureIntent?.let {
-                chooserIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS, arrayOf(it))
+            val photoIntent = captureIntent?.takeIf {
+                fileChooserParams.acceptTypes.any { type -> type.startsWith("image/") || type == "*/*" || type.isBlank() }
+            }?.apply {
+                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                clipData = android.content.ClipData.newRawUri("camera", photoUri)
             }
-
-            onShowFileChooser(filePathCallback, chooserIntent)
+            onShowFileChooser(filePathCallback, chooserIntent, photoIntent)
             return true
         }
 
         override fun onPermissionRequest(request: PermissionRequest) {
             onPermissionRequest.invoke(request)
+        }
+
+        override fun onPermissionRequestCanceled(request: PermissionRequest) {
+            onPermissionCanceled(request)
         }
 
         override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
@@ -194,6 +233,7 @@ class WebViewManager(
             fullscreenContainer = null
             customView = null
             customViewCallback?.onCustomViewHidden()
+            customViewCallback = null
 
             onBackPressedCallback?.remove()
             onBackPressedCallback = null
@@ -218,51 +258,58 @@ class WebViewManager(
 
             onProgressChanged(newProgress)
 
-            if ((newProgress == 100) && (currentUrl != null) && (currentUrl != lastUrl)) {
-                lastUrl = currentUrl
-                onPageFinished.invoke(view, currentUrl)
+            if (newProgress == 100 && view != null && currentUrl != null) {
+                onPageFinished.invoke(view, if (currentUrl == errorUrl) retryUrl() else currentUrl)
             }
         }
     }
 
-    fun getDownloadListener(webView: WebView): DownloadListener {
-        return DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-            when {
-                url.startsWith("blob:") -> {
-                    val jsScript = """
-                        (function() {
-                            var xhr = new XMLHttpRequest();
-                            xhr.open('GET', '$url', true);
-                            xhr.responseType = 'blob';
-                            xhr.onload = function(e) {
-                                if (this.status == 200) {
-                                    var blob = this.response;
-                                    var reader = new FileReader();
-                                    reader.readAsDataURL(blob);
-                                    reader.onloadend = function() {
-                                        var base64data = reader.result;
-                                        // Call the Android Interface
-                                        // 'AndroidBlob' is the name we will register in the next step
-                                        AndroidBlob.processBlobData(base64data, blob.type);
-                                    }
-                                }
-                            };
-                            xhr.send();
-                        })();
-                    """.trimIndent()
+    fun retryUrl(): String = lastFailedUrl ?: lastUrl ?: "https://aistudio.google.com/u/0/prompts/new_chat"
 
-                    webView.evaluateJavascript(jsScript, null)
-                }
+    fun reload(view: WebView) {
+        if (view.url == errorUrl) view.loadUrl(retryUrl(), spoofHeaders) else view.reload()
+    }
 
-                url.startsWith("data:") -> {
-                    val cleanUrl = url.substringAfter("base64,")
-                    val extractedMime = url.substringAfter("data:").substringBefore(";")
-                    BlobDownloaderInterface(context).processBlobData(cleanUrl, extractedMime)
-                }
-
-                else -> handleStandardDownload(url, userAgent, contentDisposition, mimeType)
+    fun installDownloadBridge(webView: WebView) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
+        WebViewCompat.addWebMessageListener(webView, "GeminiDownload", WebOriginPolicy.bridgeOrigins) {
+                view, message, sourceOrigin, isMainFrame, reply ->
+            if (isMainFrame && message.type == WebMessageCompat.TYPE_STRING && WebOriginPolicy.isBridgeOrigin(sourceOrigin.toString()) &&
+                WebOriginPolicy.origin(view.url) == WebOriginPolicy.origin(sourceOrigin.toString())) {
+                message.data?.let { blobDownloader.onMessage(it) { response -> reply.postMessage(response) } }
             }
         }
+    }
+
+    fun getDownloadListener(webView: WebView): DownloadListener =
+        DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            if (!WebOriginPolicy.canDownload(url, webView.url)) {
+                onShowToast(context.getString(R.string.download_failed))
+                return@DownloadListener
+            }
+            val pageUrl = webView.url
+            withDownloadPermission {
+                // Do not download a blob after the user has navigated to a different origin.
+                if (WebOriginPolicy.origin(pageUrl) != WebOriginPolicy.origin(webView.url)) return@withDownloadPermission
+                if (url.startsWith("blob:") || url.startsWith("data:")) {
+                    if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                        onShowToast(context.getString(R.string.update_webview))
+                    } else if (url.length > BlobDownloaderInterface.MAX_DOWNLOAD_BYTES * 4 / 3) {
+                        onShowToast(context.getString(R.string.download_too_large))
+                    } else if (blobDownloader.isBusy()) {
+                        onShowToast(context.getString(R.string.download_in_progress))
+                    } else {
+                        val token = blobDownloader.prepare()
+                        webView.evaluateJavascript(blobDownloadScript(downloadScript, url, token), null)
+                        onShowToast(context.getString(R.string.download_starting))
+                    }
+                } else handleStandardDownload(url, userAgent, contentDisposition, mimeType)
+            }
+        }
+
+    fun close() {
+        webChromeClient.onHideCustomView()
+        blobDownloader.close()
     }
 
     // --- Private Helper Functions ---
@@ -271,19 +318,23 @@ class WebViewManager(
         try {
             val intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
             val fallbackUrl = intent.getStringExtra("browser_fallback_url")
+            intent.addCategory(Intent.CATEGORY_BROWSABLE)
+            intent.component = null
+            intent.selector = null
+            intent.removeExtra("browser_fallback_url")
 
             if (intent.resolveActivity(context.packageManager) != null) {
                 onStartActivity(intent)
-            } else if (fallbackUrl != null) {
+            } else if (fallbackUrl != null && WebOriginPolicy.isInternalNavigation(fallbackUrl)) {
                 webView.loadUrl(fallbackUrl, spoofHeaders)
             } else {
-                onShowToast("Cannot handle this type of link.")
+                onShowToast(context.getString(R.string.cannot_open_link))
             }
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing intent URL: $url", e)
-            onShowToast("Error handling link.")
-            return false
+            onShowToast(context.getString(R.string.cannot_open_link))
+            return true
         }
     }
 
@@ -294,7 +345,7 @@ class WebViewManager(
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start activity for URL: $url", e)
-            onShowToast("Cannot open link.")
+            onShowToast(context.getString(R.string.cannot_open_link))
             true
         }
     }
@@ -304,19 +355,19 @@ class WebViewManager(
             val request = DownloadManager.Request(url.toUri()).apply {
                 setMimeType(mimeType)
                 addRequestHeader("User-Agent", userAgent)
-                addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url))
+                CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
                 setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                 val filename = URLUtil.guessFileName(url, contentDisposition, mimeType)
                 setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
                 setTitle(filename)
-                setDescription("Downloading file...")
+                setDescription(context.getString(R.string.download_starting))
             }
             val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
             dm.enqueue(request)
-            onShowToast("Starting download: ${URLUtil.guessFileName(url, contentDisposition, mimeType)}")
+            onShowToast(context.getString(R.string.download_starting))
         } catch (e: Exception) {
             Log.e(TAG, "Download failed for URL: $url", e)
-            onShowToast("Download failed: ${e.message}")
+            onShowToast(context.getString(R.string.download_failed))
         }
     }
 }

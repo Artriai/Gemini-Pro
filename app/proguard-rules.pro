@@ -5,14 +5,6 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# WebView JavaScript Interfaces
--keepclassmembers class com.rx.geminipro.utils.network.WebAppInterface {
-   @android.webkit.JavascriptInterface <methods>;
-}
--keepclassmembers class com.rx.geminipro.utils.network.BlobDownloaderInterface {
-   @android.webkit.JavascriptInterface <methods>;
-}
-
 # Hilt/Dagger missing rules (common for ErrorProne annotations)
 -dontwarn com.google.errorprone.annotations.**
 

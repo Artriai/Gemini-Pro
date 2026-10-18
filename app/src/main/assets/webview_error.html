@@ -169,10 +169,21 @@
         </ul>
     </div>
     <button
-            onclick="Android.retryLastUrl()"
+            onclick="location.href='geminipro://retry'"
             aria-label="Retry loading page">
         Retry
     </button>
 </div>
+<script>
+if (navigator.language.toLowerCase().startsWith('zh')) {
+    document.documentElement.lang = 'zh-CN';
+    document.querySelector('h1').textContent = '连接失败';
+    document.querySelector('.container > p').textContent = '页面暂时无法加载，请检查网络连接后重试。';
+    document.querySelector('.info-box p').textContent = '可以检查：';
+    const tips = ['网络或代理连接是否正常', '尝试切换 Wi-Fi 或移动数据', '飞行模式是否关闭'];
+    document.querySelectorAll('li').forEach((item, index) => item.textContent = tips[index]);
+    document.querySelector('button').textContent = '重试';
+}
+</script>
 </body>
 </html>

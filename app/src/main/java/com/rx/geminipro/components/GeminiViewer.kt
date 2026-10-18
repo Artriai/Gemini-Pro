@@ -24,7 +24,20 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.viewinterop.AndroidView
-import com.rx.geminipro.utils.network.WebAppInterface
+import com.rx.geminipro.utils.permissions.rememberWebPermissionHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
+import androidx.compose.runtime.*
+import com.rx.geminipro.utils.network.WebOriginPolicy
+import androidx.core.content.edit
+import com.rx.geminipro.R
+import org.json.JSONTokener
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import java.lang.ref.WeakReference
 
 @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
@@ -38,12 +51,74 @@ fun GeminiWebViewer(
     onProgressChanged: (Int) -> Unit,
     onPageFinished: (WebView, String) -> Unit,
     onCameraTmpFileCreated: (Uri) -> Unit,
+    onReloadActionCreated: ((() -> Unit) -> Unit),
 ) {
     val context = LocalContext.current
     val activity = LocalActivity.current as? ComponentActivity
-    val initialUrl = "https://aistudio.google.com/u/0/prompts/new_chat"
+    val sessionPrefs = remember(context) { context.getSharedPreferences("browser_session", android.content.Context.MODE_PRIVATE) }
+    val initialUrl = remember {
+        sessionPrefs.getString("last_page", null)?.takeIf { WebOriginPolicy.isBridgeOrigin(it) }
+            ?: "https://aistudio.google.com/u/0/prompts/new_chat"
+    }
     val spoofHeaders = mapOf("X-Requested-With" to "")
 
+    var currentWebView by remember { mutableStateOf<WebView?>(null) }
+    val permissions = rememberWebPermissionHandler { currentWebView?.url }
+    val currentPermissions by rememberUpdatedState(permissions)
+    var cameraChoice by remember { mutableStateOf<Intent?>(null) }
+    var galleryChoice by remember { mutableStateOf<Intent?>(null) }
+    var pendingCameraLaunch by remember { mutableStateOf<Intent?>(null) }
+    fun cancelUpload() {
+        cameraChoice = null
+        galleryChoice = null
+        pendingCameraLaunch = null
+        filePathCallbackState.value?.onReceiveValue(null)
+        filePathCallbackState.value = null
+    }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val intent = pendingCameraLaunch
+        pendingCameraLaunch = null
+        if (granted && intent != null) {
+            runCatching { filePickerLauncher?.launch(intent) }.onFailure { cancelUpload() }
+        } else {
+            cancelUpload()
+            Toast.makeText(context, R.string.camera_permission_denied, Toast.LENGTH_SHORT).show()
+        }
+    }
+    if (cameraChoice != null) {
+        AlertDialog(
+            onDismissRequest = { cancelUpload() },
+            title = { Text(stringResource(R.string.upload_image)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    val intent = cameraChoice
+                    cameraChoice = null
+                    galleryChoice = null
+                    if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        runCatching { filePickerLauncher?.launch(intent!!) }.onFailure { cancelUpload() }
+                    } else {
+                        pendingCameraLaunch = intent
+                        cameraLauncher.launch(android.Manifest.permission.CAMERA)
+                    }
+                }) { Text(stringResource(R.string.take_photo)) }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    val intent = galleryChoice
+                    cameraChoice = null
+                    galleryChoice = null
+                    runCatching { filePickerLauncher?.launch(intent!!) }.onFailure { cancelUpload() }
+                }) { Text(stringResource(R.string.choose_file)) }
+            },
+        )
+    }
+    var pendingDownload by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val storageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val action = pendingDownload
+        pendingDownload = null
+        if (granted) action?.invoke()
+        else Toast.makeText(context, R.string.download_permission_denied, Toast.LENGTH_SHORT).show()
+    }
     val currentVideoMode by rememberUpdatedState(isVideoSelectionMode)
     val currentCameraCallback by rememberUpdatedState(onCameraTmpFileCreated)
     val currentProgressCallback by rememberUpdatedState(onProgressChanged)
@@ -54,26 +129,50 @@ fun GeminiWebViewer(
 
     val noVideoFoundText = stringResource(com.rx.geminipro.R.string.no_video_found)
     val currentNoVideoFoundText by rememberUpdatedState(noVideoFoundText)
+    val filePickerFailedText by rememberUpdatedState(stringResource(R.string.file_picker_failed))
+    val downloadVideoText by rememberUpdatedState(stringResource(R.string.download_video_here))
+    val saveImageText by rememberUpdatedState(stringResource(R.string.save_image))
 
     val webViewManager = remember(context, activity) {
         WebViewManager(context, WeakReference(activity)).apply {
             this.onShowToast = { message -> Toast.makeText(context, message, Toast.LENGTH_SHORT).show() }
             this.onStartActivity = { intent -> context.startActivity(intent) }
-            this.onShowFileChooser = { callback, intent ->
+            this.onShowFileChooser = { callback, intent, cameraIntent ->
                 filePathCallbackState.value?.onReceiveValue(null)
                 filePathCallbackState.value = callback
                 try {
-                    filePickerLauncher?.launch(intent)
+                    if (cameraIntent != null) {
+                        cameraChoice = cameraIntent
+                        galleryChoice = intent
+                    } else filePickerLauncher?.launch(intent)
                 } catch (e: Exception) {
                     Log.e("GeminiWebViewer", "Cannot open file picker", e)
-                    this.onShowToast("Cannot open file picker")
+                    this.onShowToast(filePickerFailedText)
                     filePathCallbackState.value?.onReceiveValue(null)
                     filePathCallbackState.value = null
                 }
             }
             this.onProgressChanged = { currentProgressCallback(it) }
-            this.onPageFinished = { view, url -> currentPageFinishedCallback(view, url) }
-            this.onPermissionRequest = { request -> request.grant(request.resources) }
+            this.onPageFinished = { view, url ->
+                if (WebOriginPolicy.isBridgeOrigin(url)) sessionPrefs.edit { putString("last_page", url) }
+                currentPageFinishedCallback(view, url)
+            }
+            this.onPermissionRequest = { currentPermissions.request(it) }
+            this.onPermissionCanceled = { currentPermissions.canceled(it) }
+            this.onNavigationStarted = {
+                currentPermissions.clear()
+                pendingDownload = null
+                cancelUpload()
+            }
+            this.withDownloadPermission = { action ->
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+                    ContextCompat.checkSelfPermission(context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                    if (pendingDownload == null) {
+                        pendingDownload = action
+                        storageLauncher.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    }
+                } else action()
+            }
             this.onCameraTmpFileCreated = { uri ->
                 currentCameraCallback(uri)
             }
@@ -93,10 +192,7 @@ fun GeminiWebViewer(
                     )
                     setBackgroundColor(Color.Transparent.toArgb())
 
-                    addJavascriptInterface(
-                        com.rx.geminipro.utils.network.BlobDownloaderInterface(context),
-                        "AndroidBlob",
-                    )
+                    webViewManager.installDownloadBridge(this)
 
                     webViewManager.let { manager ->
                         webViewClient = manager.webViewClient
@@ -107,7 +203,7 @@ fun GeminiWebViewer(
                     settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
-                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                         mediaPlaybackRequiresUserGesture = false
                         cacheMode = WebSettings.LOAD_DEFAULT
                         allowFileAccess = false
@@ -125,11 +221,6 @@ fun GeminiWebViewer(
                         }
                         userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) $chromeVersionToken Mobile Safari/537.36"                    }
 
-                    addJavascriptInterface(
-                        WebAppInterface(WeakReference(this as WebView?)) { initialUrl },
-                        "Android"
-                    )
-
                     setOnTouchListener { _, event ->
                         if (event.action == android.view.MotionEvent.ACTION_DOWN) {
                             lastTouchX.floatValue = event.x
@@ -143,7 +234,7 @@ fun GeminiWebViewer(
                         val result = hitTestWebView.hitTestResult
 
                         if (currentVideoMode) {
-                            menu.add("Download Video Here").setOnMenuItemClickListener {
+                            menu.add(downloadVideoText).setOnMenuItemClickListener {
 
                                 val density = resources.displayMetrics.density
                                 val cssX = lastTouchX.floatValue / density
@@ -164,7 +255,7 @@ fun GeminiWebViewer(
                          """.trimIndent()
 
                                 evaluateJavascript(js) { resultJs ->
-                                    val url = resultJs?.replace("\"", "")
+                                    val url = runCatching { JSONTokener(resultJs).nextValue() as? String }.getOrNull()
 
                                     if (!url.isNullOrEmpty() && (url != "null")) {
                                         webViewManager.getDownloadListener(this).onDownloadStart(
@@ -192,7 +283,7 @@ fun GeminiWebViewer(
                                 val imageUrl = result.extra
 
                                 if (imageUrl != null) {
-                                    menu.add("Save Image").setOnMenuItemClickListener {
+                                    menu.add(saveImageText).setOnMenuItemClickListener {
                                         webViewManager.getDownloadListener(this).onDownloadStart(
                                             imageUrl,
                                             settings.userAgentString,
@@ -211,8 +302,26 @@ fun GeminiWebViewer(
                 }
 
                 addView(webView)
+                currentWebView = webView
+                onReloadActionCreated { webViewManager.reload(webView) }
                 onWebViewCreated(webView)
             }
-        }
+        },
+        onRelease = { container ->
+            pendingDownload = null
+            cancelUpload()
+            currentPermissions.clear()
+            filePathCallbackState.value?.onReceiveValue(null)
+            filePathCallbackState.value = null
+            webViewManager.close()
+            currentWebView?.apply {
+                stopLoading()
+                (parent as? android.view.ViewGroup)?.removeView(this)
+                removeAllViews()
+                destroy()
+            }
+            currentWebView = null
+            container.removeAllViews()
+        },
     )
 }
