@@ -8,6 +8,7 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.webkit.ValueCallback
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.LocalActivity
@@ -38,7 +39,10 @@ import org.json.JSONTokener
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import java.lang.ref.WeakReference
+import com.rx.geminipro.utils.session.BrowserSessionCache
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 
 @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 @Composable
@@ -61,6 +65,8 @@ fun GeminiWebViewer(
             ?: "https://aistudio.google.com/u/0/prompts/new_chat"
     }
     val spoofHeaders = mapOf("X-Requested-With" to "")
+    val session = remember { BrowserSessionCache.acquire(context) }
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var currentWebView by remember { mutableStateOf<WebView?>(null) }
     val permissions = rememberWebPermissionHandler { currentWebView?.url }
@@ -133,8 +139,8 @@ fun GeminiWebViewer(
     val downloadVideoText by rememberUpdatedState(stringResource(R.string.download_video_here))
     val saveImageText by rememberUpdatedState(stringResource(R.string.save_image))
 
-    val webViewManager = remember(context, activity) {
-        WebViewManager(context, WeakReference(activity)).apply {
+    val webViewManager = remember(context, activity, session) {
+        session.manager.apply {
             this.onShowToast = { message -> Toast.makeText(context, message, Toast.LENGTH_SHORT).show() }
             this.onStartActivity = { intent -> context.startActivity(intent) }
             this.onShowFileChooser = { callback, intent, cameraIntent ->
@@ -156,6 +162,7 @@ fun GeminiWebViewer(
             this.onPageFinished = { view, url ->
                 if (WebOriginPolicy.isBridgeOrigin(url)) sessionPrefs.edit { putString("last_page", url) }
                 currentPageFinishedCallback(view, url)
+                if (WebOriginPolicy.isBridgeOrigin(url)) BrowserSessionCache.flushCookies()
             }
             this.onPermissionRequest = { currentPermissions.request(it) }
             this.onPermissionCanceled = { currentPermissions.canceled(it) }
@@ -185,14 +192,16 @@ fun GeminiWebViewer(
             android.widget.FrameLayout(ctx).apply {
                 fitsSystemWindows = true
 
-                val webView = WebView(ctx).apply {
+                session.attach(activity)
+                val webView = session.view.apply {
                     layoutParams = android.widget.FrameLayout.LayoutParams(
                         MATCH_PARENT,
                         MATCH_PARENT,
                     )
                     setBackgroundColor(Color.Transparent.toArgb())
 
-                    webViewManager.installDownloadBridge(this)
+                    if (!session.started) webViewManager.installDownloadBridge(this)
+                    CookieManager.getInstance().setAcceptCookie(true)
 
                     webViewManager.let { manager ->
                         webViewClient = manager.webViewClient
@@ -298,13 +307,23 @@ fun GeminiWebViewer(
                         }
                     }
 
-                    loadUrl(initialUrl, spoofHeaders)
+                    if (!session.started) {
+                        val restored = session.savedState?.let { restoreState(it) } != null
+                        session.savedState = null
+                        session.started = true
+                        if (!restored) loadUrl(initialUrl, spoofHeaders)
+                    }
                 }
 
                 addView(webView)
                 currentWebView = webView
                 onReloadActionCreated { webViewManager.reload(webView) }
                 onWebViewCreated(webView)
+                currentProgressCallback(webView.progress)
+                webView.url?.let { url ->
+                    currentPageFinishedCallback(webView,
+                        if (url.startsWith("https://appassets.androidplatform.net/")) webViewManager.retryUrl() else url)
+                }
             }
         },
         onRelease = { container ->
@@ -313,15 +332,24 @@ fun GeminiWebViewer(
             currentPermissions.clear()
             filePathCallbackState.value?.onReceiveValue(null)
             filePathCallbackState.value = null
-            webViewManager.close()
-            currentWebView?.apply {
-                stopLoading()
-                (parent as? android.view.ViewGroup)?.removeView(this)
-                removeAllViews()
-                destroy()
-            }
+            session.detach()
             currentWebView = null
             container.removeAllViews()
         },
     )
+
+    DisposableEffect(lifecycleOwner, currentWebView) {
+        val view = currentWebView
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> view?.onResume()
+                Lifecycle.Event.ON_PAUSE -> view?.onPause()
+                Lifecycle.Event.ON_STOP -> BrowserSessionCache.flushCookies()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
 }

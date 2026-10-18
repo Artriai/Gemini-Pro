@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- A controlled compatibility fixture, not a recorded signed-in Google page. -->
+<html><body>
+<header><button aria-label="Open navigation menu">menu</button><h1>Playground</h1>
+<button aria-label="Show run settings">tune</button></header>
+<ms-right-side-panel hidden>
+  <button aria-label="Close run settings panel">close</button>
+  <div class="settings-model-selector">
+    <ms-model-selector-v3 role="button" aria-label="Select model">
+      <div class="title">Gemini 3.8 Flash</div><div class="subtitle">gemini-3.8-flash</div>
+    </ms-model-selector-v3>
+  </div>
+  <ms-thinking-level-setting><label>Thinking level</label>
+    <mat-select role="combobox"><span class="mat-mdc-select-min-line">Medium</span></mat-select>
+  </ms-thinking-level-setting>
+</ms-right-side-panel>
+<ms-prompt-input-wrapper><ms-autosize-textarea><textarea aria-label="Type something"></textarea></ms-autosize-textarea>
+<ms-run-button><button aria-label="Run" disabled>Run</button></ms-run-button>
+</ms-prompt-input-wrapper>
+<main id="turns"></main>
+</body></html>

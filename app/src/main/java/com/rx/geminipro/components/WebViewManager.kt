@@ -48,7 +48,7 @@ private const val TAG = "WebViewManager"
 
 class WebViewManager(
     private val context: Context,
-    private val activity: WeakReference<ComponentActivity>,
+    private var activity: WeakReference<ComponentActivity>,
 ) {
     var onShowFileChooser: (ValueCallback<Array<Uri>>, Intent, Intent?) -> Unit = { callback, _, _ -> callback.onReceiveValue(null) }
 
@@ -307,8 +307,29 @@ class WebViewManager(
             }
         }
 
-    fun close() {
+    fun attachActivity(owner: ComponentActivity?) {
+        activity = WeakReference(owner)
+    }
+
+    fun detach() {
         webChromeClient.onHideCustomView()
+        blobDownloader.cancel()
+        activity.clear()
+        // These callbacks capture the active screen. A cached page must not retain them.
+        onShowFileChooser = { callback, _, _ -> callback.onReceiveValue(null) }
+        onShowToast = {}
+        onStartActivity = {}
+        onPageFinished = { _, _ -> }
+        onPermissionRequest = { it.deny() }
+        onPermissionCanceled = {}
+        onNavigationStarted = {}
+        withDownloadPermission = {}
+        onCameraTmpFileCreated = {}
+        onProgressChanged = {}
+    }
+
+    fun close() {
+        detach()
         blobDownloader.close()
     }
 

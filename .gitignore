@@ -40,3 +40,4 @@ captures/
 
 # Kotlin
 .kotlin
+node_modules/

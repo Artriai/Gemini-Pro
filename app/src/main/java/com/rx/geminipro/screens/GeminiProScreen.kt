@@ -8,6 +8,7 @@ import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
@@ -32,6 +33,13 @@ import com.rx.geminipro.R
 import com.rx.geminipro.components.*
 import com.rx.geminipro.utils.system.extractPreviewContent
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.rx.geminipro.utils.session.HomeBrowserController
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import kotlinx.coroutines.Dispatchers
@@ -39,18 +47,30 @@ import kotlinx.coroutines.withContext
 import com.rx.geminipro.viewmodels.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 
 
 @Composable
 fun GeminiProScreen(
     modifier: Modifier = Modifier,
     viewModel: GeminiViewModel = hiltViewModel(),
+    homeViewModel: HomeViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val homeState by homeViewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val clipboardManager = LocalContext.current.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
     var webView by remember { mutableStateOf<WebView?>(null) }
+    val activity = LocalActivity.current
+    var mountBrowser by remember { mutableStateOf(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val homeScript = remember { context.assets.open("home_bridge.js").bufferedReader().use { it.readText() } }
+    var preparationJob by remember { mutableStateOf<Job?>(null) }
     var reloadPage by remember { mutableStateOf<(() -> Unit)?>(null) }
     val ioScope = rememberCoroutineScope()
 
@@ -137,7 +157,7 @@ fun GeminiProScreen(
                 is GeminiSideEffect.WebViewGoBack -> webView?.goBack()
                 is GeminiSideEffect.WebViewReload -> reloadPage?.invoke()
                 is GeminiSideEffect.WebViewGoForward -> webView?.goForward()
-                is GeminiSideEffect.LoadUrl -> webView?.loadUrl(effect.url)
+                is GeminiSideEffect.LoadUrl -> { homeViewModel.openWeb(); webView?.loadUrl(effect.url) }
             }
         }
     }
@@ -156,10 +176,46 @@ fun GeminiProScreen(
     val previewCode = remember(clipboardText) { extractPreviewContent(clipboardText).code }
 
     // --- Back Handler Logic ---
-    BackHandler(enabled = uiState.canWebViewGoBack) {
-        viewModel.onEvent(GeminiUiEvent.BackButtonPressed)
+    BackHandler {
+        if (isKeyboardVisible) { keyboard?.hide(); focusManager.clearFocus() }
+        else if (!homeState.visible) homeViewModel.home()
+        else activity?.moveTaskToBack(true)
     }
 
+
+    // Draw the local homepage before initializing the relatively expensive WebView.
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        withFrameNanos { }
+        mountBrowser = true
+    }
+    LaunchedEffect(webView, homeState.visible) {
+        webView?.importantForAccessibility = if (homeState.visible)
+            android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        if (!homeState.visible && homeState.problem == HomeProblem.UNCERTAIN) {
+            webView?.let { view -> runCatching { HomeBrowserController(view, homeScript).call("close") } }
+        }
+    }
+    LaunchedEffect(homeState.request?.id) {
+        if (homeState.request != null) { focusManager.clearFocus(); keyboard?.hide() }
+    }
+    LaunchedEffect(webView, homeState.visible, homeState.revision, homeState.request?.id) {
+        val view = webView ?: return@LaunchedEffect
+        if (!homeState.visible || (homeState.problem != null && homeState.request == null)) return@LaunchedEffect
+        preparationJob = currentCoroutineContext()[Job]
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            HomeBrowserController(view, homeScript).run(homeViewModel.state.value, homeViewModel)
+        }
+    }
+    fun revealWeb(history: Boolean = false, login: Boolean = false) {
+        ioScope.launch {
+            preparationJob?.cancelAndJoin()
+            webView?.let { view ->
+                runCatching { HomeBrowserController(view, homeScript).call(if (history) "history" else "close") }
+            }
+            homeViewModel.openWeb(login)
+        }
+    }
 
     // --- Menu Highlight Animation Trigger ---
     LaunchedEffect(uiState.isMenuLeft) {
@@ -175,8 +231,8 @@ fun GeminiProScreen(
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
     ) {
-        GeminiWebViewer(
-            modifier = modifier.fillMaxSize(),
+        if (mountBrowser) GeminiWebViewer(
+            modifier = Modifier.fillMaxSize().graphicsLayer { alpha = if (homeState.visible) 0f else 1f },
             filePathCallbackState = filePathCallbackState,
             filePickerLauncher = filePickerLauncher,
             isVideoSelectionMode = uiState.isVideoSelectionMode,
@@ -194,36 +250,48 @@ fun GeminiProScreen(
                     )
                 )
                 viewModel.onEvent(GeminiUiEvent.ApplicationReady)
+                if (homeViewModel.state.value.loginFlow && HomeBrowserController.isAiStudio(url)) homeViewModel.home()
             },
             onCameraTmpFileCreated = { tempCameraUri = it },
             onReloadActionCreated = { reloadPage = it },
         )
 
-        BrowserProgressBar(progress = uiState.loadingProgress)
+        if (!homeState.visible) {
+            BrowserProgressBar(progress = uiState.loadingProgress)
 
-        ReloadIndicator(isLoading = uiState.isReloading)
+            ReloadIndicator(isLoading = uiState.isReloading)
 
-        VideoModeIndicator(uiState.isVideoSelectionMode)
+            VideoModeIndicator(uiState.isVideoSelectionMode)
 
-        PreviewButtons(
-            clipboardContentType = uiState.clipboardContentType,
-            onShowDiagram = { showDiagram = true },
-            onShowHtml = { showHtmlPreview = true }
-        )
-
-        if (!uiState.isKeyboardVisible) {
-            MenuHandles(
-                isMenuLeft = uiState.isMenuLeft,
-                isHighlighting = isHighlightingMenu,
-                onReload = { viewModel.onEvent(GeminiUiEvent.ReloadPageClicked) },
-                onOpenMenu = { showAdditionalMenu = true }
+            PreviewButtons(
+                clipboardContentType = uiState.clipboardContentType,
+                onShowDiagram = { showDiagram = true },
+                onShowHtml = { showHtmlPreview = true }
             )
+
+            if (!uiState.isKeyboardVisible) {
+                MenuHandles(
+                    isMenuLeft = uiState.isMenuLeft,
+                    isHighlighting = isHighlightingMenu,
+                    onReload = { viewModel.onEvent(GeminiUiEvent.ReloadPageClicked) },
+                    onOpenMenu = { showAdditionalMenu = true }
+                )
+            }
+
+        }
+
+        if (homeState.visible) {
+            NativeHomeScreen(state = homeState, home = homeViewModel,
+                onOpenWeb = { revealWeb() }, onHistory = { revealWeb(history = true) },
+                onTools = { showAdditionalMenu = true }, onLogin = { revealWeb(login = true) })
         }
 
         if (showAdditionalMenu) {
             AdditionalMenu(
                 onClose = { showAdditionalMenu = false },
-                items = rememberMenuItems(viewModel::onEvent, uiState.isMenuLeft)
+                items = listOf(MenuItemData(R.drawable.home_house, stringResource(R.string.home_return)) {
+                    homeViewModel.home()
+                }) + rememberMenuItems(viewModel::onEvent, uiState.isMenuLeft)
             )
         }
 

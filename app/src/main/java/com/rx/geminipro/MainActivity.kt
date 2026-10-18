@@ -13,6 +13,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowCompat
+import com.rx.geminipro.utils.session.BrowserSessionCache
 import com.rx.geminipro.viewmodels.GeminiViewModel
 import com.rx.geminipro.ui.theme.GeminiProTheme
 import com.rx.geminipro.screens.GeminiProScreen
@@ -23,16 +24,10 @@ class MainActivity : ComponentActivity() {
     private val geminiViewModel: GeminiViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val splash = installSplashScreen()
         super.onCreate(savedInstanceState)
-        val splashDeadline = android.os.SystemClock.elapsedRealtime() + 4000
-        installSplashScreen().apply {
-            setKeepOnScreenCondition {
-                !geminiViewModel.uiState.value.isApplicationReady && android.os.SystemClock.elapsedRealtime() < splashDeadline
-            }
-            setOnExitAnimationListener { screen ->
-                screen.remove()
-            }
-        }
+        BrowserSessionCache.prepareRestore(savedInstanceState?.getBundle(BrowserSessionCache.STATE_KEY))
+        splash.setOnExitAnimationListener { it.remove() }
 
         enableEdgeToEdge()
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -42,6 +37,11 @@ class MainActivity : ComponentActivity() {
                 GeminiProApp(geminiViewModel)
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        BrowserSessionCache.saveNavigationState()?.let { outState.putBundle(BrowserSessionCache.STATE_KEY, it) }
+        super.onSaveInstanceState(outState)
     }
 }
 
@@ -60,5 +60,5 @@ private fun GeminiProApp(viewModel: GeminiViewModel) {
         }
     }
 
-    GeminiProScreen()
+    GeminiProScreen(viewModel = viewModel)
 }
